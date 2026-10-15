@@ -117,6 +117,17 @@ def node_commit(state: ReviewState) -> dict:
     console.print("[cyan]→ commit[/cyan]")
     if state.get("human_choice") == "approve":
         return {"final_action": _post(state, "committed")}
+    if state.get("human_choice") == "edit" and state.get("human_feedback"):
+        # Bonus challenge 4: Auto-edit using human_feedback
+        console.print("[cyan]→ auto_edit[/cyan]  [dim]rewriting review with human feedback (Bonus 4)...[/dim]")
+        llm = get_llm().with_structured_output(PRAnalysis)
+        with console.status("[dim]LLM rewriting review...[/dim]"):
+            edited: PRAnalysis = llm.invoke([
+                {"role": "system", "content": "Senior code reviewer. Structured output. Rewrite and refine the review incorporating the human reviewer feedback."},
+                {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}\n\nOriginal summary: {state['analysis'].summary}\n\nReviewer feedback: {state['human_feedback']}"},
+            ])
+        state["analysis"] = edited
+        return {"analysis": edited, "final_action": _post(state, "committed_after_edit")}
     console.print(f"  [yellow]·[/yellow] skipping comment (choice={state.get('human_choice')})")
     return {"final_action": "rejected"}
 

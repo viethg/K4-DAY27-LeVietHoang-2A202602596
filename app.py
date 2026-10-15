@@ -96,6 +96,26 @@ with st.sidebar:
     except Exception as e:
         st.caption(f"No sessions loaded: {e}")
 
+    st.divider()
+    st.header("Bonus: Calibration")
+    try:
+        from audit.calibrate import compute_calibration
+        cal = asyncio.run(compute_calibration())
+        avg_c = cal["avg_confidence"]
+        app_r = cal["approval_rate"]
+        st.metric("Model Avg Conf", f"{avg_c:.1%}")
+        st.metric("Human Approval Rate", f"{app_r:.1%}")
+        if cal["total_human"] > 0:
+            diff = avg_c - app_r
+            if diff > 0.10:
+                st.warning("⚠️ Model is Over-confident")
+            elif diff < -0.10:
+                st.info("ℹ️ Model is Under-confident")
+            else:
+                st.success("✅ Model is Well-calibrated")
+    except Exception as e:
+        st.caption(f"Calibration info: {e}")
+
 
 # ─── Top form — start a new review ─────────────────────────────────────────
 with st.form("start"):
@@ -120,13 +140,16 @@ def render_approval_card(payload: dict) -> dict | None:
     with st.expander("Diff"):
         st.code(payload.get("diff_preview", ""), language="diff")
 
-    feedback = st.text_input("Feedback (optional)", key="approval_feedback")
+    feedback = st.text_input("Feedback (optional for approve/reject; required for edit)", key="approval_feedback")
     col1, col2, col3 = st.columns(3)
     if col1.button("Approve", type="primary", key="btn_approve"):
         return {"choice": "approve", "feedback": feedback}
     if col2.button("Reject", key="btn_reject"):
         return {"choice": "reject", "feedback": feedback}
-    if col3.button("Edit", key="btn_edit"):
+    if col3.button("Edit (Bonus 4)", key="btn_edit"):
+        if not feedback:
+            st.warning("Please enter your edit feedback in the text box above first.")
+            return None
         return {"choice": "edit", "feedback": feedback}
     return None
 

@@ -234,18 +234,31 @@ def _post(state) -> str:
 async def node_commit(state):
     console.print("[cyan]→ commit[/cyan]")
     t0 = time.monotonic()
-    # Two paths converge here:
-    #   1. human_approval → commit (only post if approved)
-    #   2. escalate → synthesize → commit (always post the refined review)
+    # Paths converge here:
+    #   1. human_approval (approve) → commit
+    #   2. human_approval (edit) → auto-edit via LLM with feedback → commit (Bonus 4)
+    #   3. escalate → synthesize → commit (always post the refined review)
+    #   4. human_approval (reject) → skip
     if state.get("escalation_answers") or state.get("human_choice") == "approve":
         action = _post(state)
+    elif state.get("human_choice") == "edit" and state.get("human_feedback"):
+        console.print("[cyan]→ auto_edit[/cyan]  [dim]rewriting review with human feedback (Bonus 4)...[/dim]")
+        llm = get_llm().with_structured_output(PRAnalysis)
+        with console.status("[dim]LLM rewriting review...[/dim]"):
+            edited: PRAnalysis = await llm.ainvoke([
+                {"role": "system", "content": "Senior code reviewer. Structured output. Rewrite and refine the review incorporating the human reviewer feedback."},
+                {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}\n\nOriginal summary: {state['analysis'].summary}\n\nReviewer feedback: {state['human_feedback']}"},
+            ])
+        state["analysis"] = edited
+        action = _post(state)
+        action = f"{action}_after_edit" if action == "committed" else action
     else:
         console.print(f"  [yellow]·[/yellow] skipping comment (choice={state.get('human_choice')})")
         action = "rejected"
 
     c = state["analysis"].confidence
     reviewer = os.environ.get("GITHUB_USER") if (state.get("human_choice") or state.get("escalation_answers")) else None
-    commit_decision = "approve" if action in ("committed", "committed_after_escalation") else ("reject" if action == "rejected" else "pending")
+    commit_decision = "approve" if action in ("committed", "committed_after_escalation", "committed_after_edit") else ("reject" if action == "rejected" else "edit" if "edit" in action else "pending")
     await audit(state, AuditEntry(
         agent_id=AGENT_ID,
         action="commit",
@@ -253,10 +266,10 @@ async def node_commit(state):
         risk_level=risk_level_for(c),
         reviewer_id=reviewer,
         decision=commit_decision,
-        reason=f"Action: {action}",
+        reason=f"Action: {action}" + (f" | feedback: {state.get('human_feedback')}" if state.get("human_feedback") else ""),
         execution_time_ms=int((time.monotonic() - t0) * 1000),
     ))
-    return {"final_action": action}
+    return {"analysis": state["analysis"], "final_action": action}
 
 
 async def node_auto_approve(state):
