@@ -7,7 +7,15 @@ clarifying questions and then synthesizes a refined review from the answers.
 from __future__ import annotations
 
 import argparse
+import sys
 import uuid
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 from dotenv import load_dotenv
 from langgraph.checkpoint.memory import MemorySaver
@@ -42,11 +50,18 @@ def node_analyze(state):
     llm = get_llm().with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
         analysis = llm.invoke([
-            {"role": "system", "content": (
-                "Senior reviewer. Structured output. "
-                # TODO: add an instruction: if confidence < 60%, populate escalation_questions
-                # with 2–4 specific, context-rich questions (reference which file/section in the diff).
-            )},
+            {
+                "role": "system",
+                "content": (
+                    "Senior code reviewer. Provide structured output. "
+                    "Calibrate confidence: Trivial/safe PRs with no risks: >0.73 (auto-approve). "
+                    "Medium-risk PRs with schema/migration questions or edge cases: 0.60-0.70 (human approval). "
+                    "High-risk PRs with security flaws, plaintext tokens, SQL injection, hardcoded secrets: <0.55 (escalate). "
+                    "If confidence < 0.58 (or when escalating), you MUST populate escalation_questions "
+                    "with 2–4 specific, context-rich questions (referencing specific files, functions, or lines in the diff, "
+                    "e.g. asking about MD5 password hashing, SQL injection in Storage.add, plaintext token storage, or hardcoded user IDs)."
+                ),
+            },
             {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
         ])
     console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.escalation_questions)} question(s)")
@@ -71,22 +86,48 @@ def node_escalate(state: ReviewState) -> dict:
         # fallback when the LLM didn't generate any questions
         questions = ["What is the intent of this PR?", "Any migration concerns?"]
 
-    # TODO: call interrupt(payload) where payload kind="escalation" contains:
-    #       pr_url, confidence, confidence_reasoning, summary, risk_factors, questions.
-    # answers = interrupt({...})
-    # return {"escalation_answers": answers}
-    raise NotImplementedError("Call interrupt() with an escalation payload")
+    answers = interrupt({
+        "kind": "escalation",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "risk_factors": a.risk_factors,
+        "questions": questions,
+    })
+    return {"escalation_answers": answers}
 
 
 def node_synthesize(state: ReviewState) -> dict:
     """Re-prompt LLM with the reviewer's answers and produce a refined review."""
-    # TODO:
-    #   - read state["escalation_answers"] (dict[question, answer])
-    #   - call get_llm().with_structured_output(PRAnalysis).invoke(...) with a prompt
-    #     containing the original diff + initial analysis + Q&A.
-    #   - return {"analysis": refined}
-    # `node_commit` will then post the refined review to the PR.
-    raise NotImplementedError("Synthesize a refined PRAnalysis using the reviewer answers")
+    qa_lines = []
+    answers = state.get("escalation_answers") or {}
+    for q, a in answers.items():
+        qa_lines.append(f"Q: {q}\nA: {a}")
+    qa_text = "\n".join(qa_lines)
+
+    llm = get_llm().with_structured_output(PRAnalysis)
+    with console.status("[dim]LLM synthesizing refined review...[/dim]"):
+        refined = llm.invoke([
+            {
+                "role": "system",
+                "content": (
+                    "Senior code reviewer. Structured output. "
+                    "Synthesize a refined review of the PR diff taking into account the reviewer's answers to the escalation questions. "
+                    "Update summary, risk factors, comments, and confidence accordingly."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Title: {state['pr_title']}\n"
+                    f"Diff:\n{state['pr_diff']}\n\n"
+                    f"Initial analysis summary:\n{state['analysis'].summary}\n\n"
+                    f"Reviewer answers to escalation questions:\n{qa_text}"
+                ),
+            },
+        ])
+    return {"analysis": refined}
 
 
 def node_human_approval(state):
@@ -161,7 +202,8 @@ def build_graph():
     g.add_edge("auto_approve", END)
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
-    # TODO: wire escalate → synthesize → commit  (commit already → END)
+    g.add_edge("escalate", "synthesize")
+    g.add_edge("synthesize", "commit")
     return g.compile(checkpointer=MemorySaver())
 
 
